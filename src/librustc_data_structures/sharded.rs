@@ -22,6 +22,7 @@ const SHARD_BITS: usize = 0;
 pub const SHARDS: usize = 1 << SHARD_BITS;
 
 /// An array of cache-line aligned inner locked structures with convenience methods.
+/// Shards are selected by hashing values with `FxHasher`.
 #[derive(Clone)]
 pub struct Sharded<T> {
     shards: [CacheAligned<Lock<T>>; SHARDS],
@@ -69,6 +70,8 @@ impl<T> Sharded<T> {
         }
     }
 
+    /// Get a shard with a pre-computed hash value, which must be computed by
+    /// `FxHasher`.
     #[inline]
     pub fn get_shard_by_hash(&self, hash: u64) -> &Lock<T> {
         let hash_len = mem::size_of::<usize>();
