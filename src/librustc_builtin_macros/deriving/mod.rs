@@ -1,10 +1,10 @@
 //! The compiler code necessary to implement the `#[derive]` extensions.
 
+use rustc_ast::ast::{self, ItemKind, MetaItem};
+use rustc_ast::ptr::P;
 use rustc_expand::base::{Annotatable, ExtCtxt, MultiItemModifier};
 use rustc_span::symbol::{sym, Symbol};
 use rustc_span::Span;
-use syntax::ast::{self, ItemKind, MetaItem};
-use syntax::ptr::P;
 
 macro path_local($x:ident) {
     generic::ty::Path::new_local(stringify!($x))
@@ -157,10 +157,10 @@ fn inject_impl_of_structural_trait(
         ast::Ident::invalid(),
         attrs,
         ItemKind::Impl {
-            unsafety: ast::Unsafety::Normal,
+            unsafety: ast::Unsafe::No,
             polarity: ast::ImplPolarity::Positive,
             defaultness: ast::Defaultness::Final,
-            constness: ast::Constness::NotConst,
+            constness: ast::Const::No,
             generics,
             of_trait: Some(trait_ref),
             self_ty: self_type,

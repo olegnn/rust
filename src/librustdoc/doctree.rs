@@ -2,10 +2,10 @@
 //! manner (and with prettier names) before cleaning.
 pub use self::StructType::*;
 
+use rustc_ast::ast;
+use rustc_ast::ast::Name;
 use rustc_span::hygiene::MacroKind;
 use rustc_span::{self, Span};
-use syntax::ast;
-use syntax::ast::Name;
 
 use rustc_hir as hir;
 use rustc_hir::def_id::CrateNum;
@@ -203,7 +203,7 @@ pub struct Impl<'hir> {
     pub unsafety: hir::Unsafety,
     pub polarity: hir::ImplPolarity,
     pub defaultness: hir::Defaultness,
-    pub constness: ast::Constness,
+    pub constness: hir::Constness,
     pub generics: &'hir hir::Generics<'hir>,
     pub trait_: &'hir Option<hir::TraitRef<'hir>>,
     pub for_: &'hir hir::Ty<'hir>,

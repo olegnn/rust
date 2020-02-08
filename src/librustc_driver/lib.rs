@@ -5,12 +5,7 @@
 //! This API is completely unstable and subject to change.
 
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/")]
-#![feature(box_syntax)]
-#![cfg_attr(unix, feature(libc))]
 #![feature(nll)]
-#![feature(set_stdio)]
-#![feature(no_debug)]
-#![feature(integer_atomics)]
 #![recursion_limit = "256"]
 
 pub extern crate getopts;
@@ -31,25 +26,30 @@ use rustc::session::{config, DiagnosticOutput, Session};
 use rustc::session::{early_error, early_warn};
 use rustc::ty::TyCtxt;
 use rustc::util::common::ErrorReported;
+use rustc_codegen_ssa::CodegenResults;
 use rustc_codegen_utils::codegen_backend::CodegenBackend;
 use rustc_data_structures::profiling::print_time_passes_entry;
 use rustc_data_structures::sync::SeqCst;
-use rustc_errors::{registry::Registry, PResult};
+use rustc_errors::{
+    registry::{InvalidErrorCode, Registry},
+    PResult,
+};
 use rustc_feature::{find_gated_cfg, UnstableFeatures};
 use rustc_hir::def_id::LOCAL_CRATE;
-use rustc_interface::util::get_builtin_codegen_backend;
+use rustc_interface::util::{collect_crate_types, get_builtin_codegen_backend};
 use rustc_interface::{interface, Queries};
 use rustc_lint::LintStore;
 use rustc_metadata::locator;
 use rustc_save_analysis as save;
 use rustc_save_analysis::DumpHandler;
-use rustc_serialize::json::ToJson;
+use rustc_serialize::json::{self, ToJson};
 
 use std::borrow::Cow;
 use std::cmp::max;
 use std::default::Default;
 use std::env;
 use std::ffi::OsString;
+use std::fs;
 use std::io::{self, Read, Write};
 use std::mem;
 use std::panic::{self, catch_unwind};
@@ -58,10 +58,10 @@ use std::process::{self, Command, Stdio};
 use std::str;
 use std::time::Instant;
 
+use rustc_ast::ast;
 use rustc_span::source_map::FileLoader;
 use rustc_span::symbol::sym;
 use rustc_span::FileName;
-use syntax::ast;
 
 mod args;
 pub mod pretty;
@@ -122,10 +122,6 @@ pub trait Callbacks {
         Compilation::Continue
     }
 }
-
-pub struct DefaultCallbacks;
-
-impl Callbacks for DefaultCallbacks {}
 
 #[derive(Default)]
 pub struct TimePassesCallbacks {
@@ -286,7 +282,8 @@ pub fn run_compiler(
                 &matches,
                 compiler.input(),
             )
-        });
+        })
+        .and_then(|| RustcDefaultCalls::try_process_rlink(sess, compiler));
 
         if should_stop == Compilation::Stop {
             return sess.compile_status();
@@ -527,12 +524,11 @@ fn stdout_isatty() -> bool {
 
 fn handle_explain(registry: Registry, code: &str, output: ErrorOutputType) {
     let normalised =
-        if code.starts_with("E") { code.to_string() } else { format!("E{0:0>4}", code) };
-    match registry.find_description(&normalised) {
-        Some(ref description) => {
+        if code.starts_with('E') { code.to_string() } else { format!("E{0:0>4}", code) };
+    match registry.try_find_description(&normalised) {
+        Ok(Some(description)) => {
             let mut is_in_code_block = false;
             let mut text = String::new();
-
             // Slice off the leading newline and print.
             for line in description.lines() {
                 let indent_level =
@@ -548,15 +544,17 @@ fn handle_explain(registry: Registry, code: &str, output: ErrorOutputType) {
                 }
                 text.push('\n');
             }
-
             if stdout_isatty() {
                 show_content_with_pager(&text);
             } else {
                 print!("{}", text);
             }
         }
-        None => {
+        Ok(None) => {
             early_error(output, &format!("no extended information for {}", code));
+        }
+        Err(InvalidErrorCode) => {
+            early_error(output, &format!("{} is not a valid error code", code));
         }
     }
 }
@@ -593,6 +591,34 @@ fn show_content_with_pager(content: &String) {
 }
 
 impl RustcDefaultCalls {
+    fn process_rlink(sess: &Session, compiler: &interface::Compiler) -> Result<(), ErrorReported> {
+        if let Input::File(file) = compiler.input() {
+            // FIXME: #![crate_type] and #![crate_name] support not implemented yet
+            let attrs = vec![];
+            sess.crate_types.set(collect_crate_types(sess, &attrs));
+            let outputs = compiler.build_output_filenames(&sess, &attrs);
+            let rlink_data = fs::read_to_string(file).unwrap_or_else(|err| {
+                sess.fatal(&format!("failed to read rlink file: {}", err));
+            });
+            let codegen_results: CodegenResults = json::decode(&rlink_data).unwrap_or_else(|err| {
+                sess.fatal(&format!("failed to decode rlink: {}", err));
+            });
+            compiler.codegen_backend().link(&sess, Box::new(codegen_results), &outputs)
+        } else {
+            sess.fatal("rlink must be a file")
+        }
+    }
+
+    pub fn try_process_rlink(sess: &Session, compiler: &interface::Compiler) -> Compilation {
+        if sess.opts.debugging_opts.link_only {
+            let result = RustcDefaultCalls::process_rlink(sess, compiler);
+            abort_on_err(result, sess);
+            Compilation::Stop
+        } else {
+            Compilation::Continue
+        }
+    }
+
     pub fn list_metadata(
         sess: &Session,
         metadata_loader: &dyn MetadataLoader,
@@ -668,7 +694,7 @@ impl RustcDefaultCalls {
                         println!("{}", id);
                         continue;
                     }
-                    let crate_types = rustc_interface::util::collect_crate_types(sess, attrs);
+                    let crate_types = collect_crate_types(sess, attrs);
                     for &style in &crate_types {
                         let fname = rustc_codegen_utils::link::filename_for_input(
                             sess, style, &id, &t_outputs,

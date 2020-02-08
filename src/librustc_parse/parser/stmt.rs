@@ -2,19 +2,19 @@ use super::diagnostics::Error;
 use super::expr::LhsExpr;
 use super::pat::GateOr;
 use super::path::PathStyle;
-use super::{BlockMode, Parser, PrevTokenKind, Restrictions, SemiColonMode};
+use super::{BlockMode, Parser, Restrictions, SemiColonMode};
 use crate::maybe_whole;
 use crate::DirectoryOwnership;
 
+use rustc_ast::ast;
+use rustc_ast::ast::{AttrStyle, AttrVec, Attribute, Mac, MacStmtStyle};
+use rustc_ast::ast::{Block, BlockCheckMode, Expr, ExprKind, Local, Stmt, StmtKind, DUMMY_NODE_ID};
+use rustc_ast::ptr::P;
+use rustc_ast::token::{self, TokenKind};
+use rustc_ast::util::classify;
 use rustc_errors::{Applicability, PResult};
-use rustc_span::source_map::{respan, BytePos, Span};
-use rustc_span::symbol::{kw, sym, Symbol};
-use syntax::ast;
-use syntax::ast::{AttrStyle, AttrVec, Attribute, Mac, MacStmtStyle, VisibilityKind};
-use syntax::ast::{Block, BlockCheckMode, Expr, ExprKind, Local, Stmt, StmtKind, DUMMY_NODE_ID};
-use syntax::ptr::P;
-use syntax::token::{self, TokenKind};
-use syntax::util::classify;
+use rustc_span::source_map::{BytePos, Span};
+use rustc_span::symbol::{kw, sym};
 
 use std::mem;
 
@@ -22,87 +22,45 @@ impl<'a> Parser<'a> {
     /// Parses a statement. This stops just before trailing semicolons on everything but items.
     /// e.g., a `StmtKind::Semi` parses to a `StmtKind::Expr`, leaving the trailing `;` unconsumed.
     pub fn parse_stmt(&mut self) -> PResult<'a, Option<Stmt>> {
-        Ok(self.parse_stmt_without_recovery(true).unwrap_or_else(|mut e| {
+        Ok(self.parse_stmt_without_recovery().unwrap_or_else(|mut e| {
             e.emit();
             self.recover_stmt_(SemiColonMode::Break, BlockMode::Ignore);
             None
         }))
     }
 
-    fn parse_stmt_without_recovery(
-        &mut self,
-        macro_legacy_warnings: bool,
-    ) -> PResult<'a, Option<Stmt>> {
+    fn parse_stmt_without_recovery(&mut self) -> PResult<'a, Option<Stmt>> {
         maybe_whole!(self, NtStmt, |x| Some(x));
 
         let attrs = self.parse_outer_attributes()?;
         let lo = self.token.span;
 
-        if self.eat_keyword(kw::Let) {
-            return self.parse_local_mk(lo, attrs.into()).map(Some);
-        }
-        if self.is_kw_followed_by_ident(kw::Mut) {
-            return self.recover_stmt_local(lo, attrs.into(), "missing keyword", "let mut");
-        }
-        if self.is_kw_followed_by_ident(kw::Auto) {
+        let stmt = if self.eat_keyword(kw::Let) {
+            self.parse_local_mk(lo, attrs.into())?
+        } else if self.is_kw_followed_by_ident(kw::Mut) {
+            self.recover_stmt_local(lo, attrs.into(), "missing keyword", "let mut")?
+        } else if self.is_kw_followed_by_ident(kw::Auto) {
             self.bump(); // `auto`
             let msg = "write `let` instead of `auto` to introduce a new variable";
-            return self.recover_stmt_local(lo, attrs.into(), msg, "let");
-        }
-        if self.is_kw_followed_by_ident(sym::var) {
+            self.recover_stmt_local(lo, attrs.into(), msg, "let")?
+        } else if self.is_kw_followed_by_ident(sym::var) {
             self.bump(); // `var`
             let msg = "write `let` instead of `var` to introduce a new variable";
-            return self.recover_stmt_local(lo, attrs.into(), msg, "let");
-        }
-
-        let mac_vis = respan(lo, VisibilityKind::Inherited);
-        if let Some(macro_def) = self.eat_macro_def(&attrs, &mac_vis, lo)? {
-            return Ok(Some(self.mk_stmt(lo.to(self.prev_span), StmtKind::Item(macro_def))));
-        }
-
-        // Starts like a simple path, being careful to avoid contextual keywords
-        // such as a union items, item with `crate` visibility or auto trait items.
-        // Our goal here is to parse an arbitrary path `a::b::c` but not something that starts
-        // like a path (1 token), but it fact not a path.
-        if self.token.is_path_start()
+            self.recover_stmt_local(lo, attrs.into(), msg, "let")?
+        } else if self.token.is_path_start()
             && !self.token.is_qpath_start()
-            && !self.is_union_item() // `union::b::c` - path, `union U { ... }` - not a path.
-            && !self.is_crate_vis() // `crate::b::c` - path, `crate struct S;` - not a path.
-            && !self.is_auto_trait_item()
-            && !self.is_async_fn()
+            && !self.is_path_start_item()
         {
-            let path = self.parse_path(PathStyle::Expr)?;
-
-            if self.eat(&token::Not) {
-                return self.parse_stmt_mac(lo, attrs.into(), path, macro_legacy_warnings);
-            }
-
-            let expr = if self.check(&token::OpenDelim(token::Brace)) {
-                self.parse_struct_expr(lo, path, AttrVec::new())?
-            } else {
-                let hi = self.prev_span;
-                self.mk_expr(lo.to(hi), ExprKind::Path(None, path), AttrVec::new())
-            };
-
-            let expr = self.with_res(Restrictions::STMT_EXPR, |this| {
-                let expr = this.parse_dot_or_call_expr_with(expr, lo, attrs.into())?;
-                this.parse_assoc_expr_with(0, LhsExpr::AlreadyParsed(expr))
-            })?;
-            return Ok(Some(self.mk_stmt(lo.to(self.prev_span), StmtKind::Expr(expr))));
-        }
-
-        // FIXME: Bad copy of attrs
-        let old_directory_ownership =
-            mem::replace(&mut self.directory.ownership, DirectoryOwnership::UnownedViaBlock);
-        let item = self.parse_item_(attrs.clone(), false, true)?;
-        self.directory.ownership = old_directory_ownership;
-
-        if let Some(item) = item {
-            return Ok(Some(self.mk_stmt(lo.to(item.span), StmtKind::Item(item))));
-        }
-
-        // Do not attempt to parse an expression if we're done here.
-        if self.token == token::Semi {
+            // We have avoided contextual keywords like `union`, items with `crate` visibility,
+            // or `auto trait` items. We aim to parse an arbitrary path `a::b` but not something
+            // that starts like a path (1 token), but it fact not a path.
+            // Also, we avoid stealing syntax from `parse_item_`.
+            self.parse_stmt_path_start(lo, attrs)?
+        } else if let Some(item) = self.parse_stmt_item(attrs.clone())? {
+            // FIXME: Bad copy of attrs
+            self.mk_stmt(lo.to(item.span), StmtKind::Item(P(item)))
+        } else if self.token == token::Semi {
+            // Do not attempt to parse an expression if we're done here.
             self.error_outer_attrs(&attrs);
             self.bump();
             let mut last_semi = lo;
@@ -117,31 +75,52 @@ impl<'a> Parser<'a> {
                 ExprKind::Tup(Vec::new()),
                 AttrVec::new(),
             ));
-            return Ok(Some(self.mk_stmt(lo.to(last_semi), kind)));
-        }
-
-        if self.token == token::CloseDelim(token::Brace) {
+            self.mk_stmt(lo.to(last_semi), kind)
+        } else if self.token != token::CloseDelim(token::Brace) {
+            // Remainder are line-expr stmts.
+            let e = self.parse_expr_res(Restrictions::STMT_EXPR, Some(attrs.into()))?;
+            self.mk_stmt(lo.to(e.span), StmtKind::Expr(e))
+        } else {
             self.error_outer_attrs(&attrs);
             return Ok(None);
+        };
+        Ok(Some(stmt))
+    }
+
+    fn parse_stmt_item(&mut self, attrs: Vec<Attribute>) -> PResult<'a, Option<ast::Item>> {
+        let old = mem::replace(&mut self.directory.ownership, DirectoryOwnership::UnownedViaBlock);
+        let item = self.parse_item_common(attrs, false, true, |_| true)?;
+        self.directory.ownership = old;
+        Ok(item)
+    }
+
+    fn parse_stmt_path_start(&mut self, lo: Span, attrs: Vec<Attribute>) -> PResult<'a, Stmt> {
+        let path = self.parse_path(PathStyle::Expr)?;
+
+        if self.eat(&token::Not) {
+            return self.parse_stmt_mac(lo, attrs.into(), path);
         }
 
-        // Remainder are line-expr stmts.
-        let e = self.parse_expr_res(Restrictions::STMT_EXPR, Some(attrs.into()))?;
-        Ok(Some(self.mk_stmt(lo.to(e.span), StmtKind::Expr(e))))
+        let expr = if self.check(&token::OpenDelim(token::Brace)) {
+            self.parse_struct_expr(lo, path, AttrVec::new())?
+        } else {
+            let hi = self.prev_token.span;
+            self.mk_expr(lo.to(hi), ExprKind::Path(None, path), AttrVec::new())
+        };
+
+        let expr = self.with_res(Restrictions::STMT_EXPR, |this| {
+            let expr = this.parse_dot_or_call_expr_with(expr, lo, attrs.into())?;
+            this.parse_assoc_expr_with(0, LhsExpr::AlreadyParsed(expr))
+        })?;
+        Ok(self.mk_stmt(lo.to(self.prev_token.span), StmtKind::Expr(expr)))
     }
 
     /// Parses a statement macro `mac!(args)` provided a `path` representing `mac`.
     /// At this point, the `!` token after the path has already been eaten.
-    fn parse_stmt_mac(
-        &mut self,
-        lo: Span,
-        attrs: AttrVec,
-        path: ast::Path,
-        legacy_warnings: bool,
-    ) -> PResult<'a, Option<Stmt>> {
+    fn parse_stmt_mac(&mut self, lo: Span, attrs: AttrVec, path: ast::Path) -> PResult<'a, Stmt> {
         let args = self.parse_mac_args()?;
         let delim = args.delim();
-        let hi = self.prev_span;
+        let hi = self.prev_token.span;
 
         let style =
             if delim == token::Brace { MacStmtStyle::Braces } else { MacStmtStyle::NoBraces };
@@ -150,30 +129,6 @@ impl<'a> Parser<'a> {
 
         let kind = if delim == token::Brace || self.token == token::Semi || self.token == token::Eof
         {
-            StmtKind::Mac(P((mac, style, attrs.into())))
-        }
-        // We used to incorrectly stop parsing macro-expanded statements here.
-        // If the next token will be an error anyway but could have parsed with the
-        // earlier behavior, stop parsing here and emit a warning to avoid breakage.
-        else if legacy_warnings
-            && self.token.can_begin_expr()
-            && match self.token.kind {
-                // These can continue an expression, so we can't stop parsing and warn.
-                token::OpenDelim(token::Paren)
-                | token::OpenDelim(token::Bracket)
-                | token::BinOp(token::Minus)
-                | token::BinOp(token::Star)
-                | token::BinOp(token::And)
-                | token::BinOp(token::Or)
-                | token::AndAnd
-                | token::OrOr
-                | token::DotDot
-                | token::DotDotDot
-                | token::DotDotEq => false,
-                _ => true,
-            }
-        {
-            self.warn_missing_semicolon();
             StmtKind::Mac(P((mac, style, attrs)))
         } else {
             // Since none of the above applied, this is an expression statement macro.
@@ -183,24 +138,20 @@ impl<'a> Parser<'a> {
             let e = self.parse_assoc_expr_with(0, LhsExpr::AlreadyParsed(e))?;
             StmtKind::Expr(e)
         };
-        Ok(Some(self.mk_stmt(lo.to(hi), kind)))
+        Ok(self.mk_stmt(lo.to(hi), kind))
     }
 
     /// Error on outer attributes in this context.
     /// Also error if the previous token was a doc comment.
     fn error_outer_attrs(&self, attrs: &[Attribute]) {
         if !attrs.is_empty() {
-            if self.prev_token_kind == PrevTokenKind::DocComment {
-                self.span_fatal_err(self.prev_span, Error::UselessDocComment).emit();
+            if matches!(self.prev_token.kind, TokenKind::DocComment(..)) {
+                self.span_fatal_err(self.prev_token.span, Error::UselessDocComment).emit();
             } else if attrs.iter().any(|a| a.style == AttrStyle::Outer) {
                 self.struct_span_err(self.token.span, "expected statement after outer attribute")
                     .emit();
             }
         }
-    }
-
-    pub(super) fn is_kw_followed_by_ident(&self, kw: Symbol) -> bool {
-        self.token.is_keyword(kw) && self.look_ahead(1, |t| t.is_ident() && !t.is_reserved_ident())
     }
 
     fn recover_stmt_local(
@@ -209,29 +160,29 @@ impl<'a> Parser<'a> {
         attrs: AttrVec,
         msg: &str,
         sugg: &str,
-    ) -> PResult<'a, Option<Stmt>> {
+    ) -> PResult<'a, Stmt> {
         let stmt = self.parse_local_mk(lo, attrs)?;
         self.struct_span_err(lo, "invalid variable declaration")
             .span_suggestion(lo, msg, sugg.to_string(), Applicability::MachineApplicable)
             .emit();
-        Ok(Some(stmt))
+        Ok(stmt)
     }
 
     fn parse_local_mk(&mut self, lo: Span, attrs: AttrVec) -> PResult<'a, Stmt> {
-        let local = self.parse_local(attrs.into())?;
-        Ok(self.mk_stmt(lo.to(self.prev_span), StmtKind::Local(local)))
+        let local = self.parse_local(attrs)?;
+        Ok(self.mk_stmt(lo.to(self.prev_token.span), StmtKind::Local(local)))
     }
 
     /// Parses a local variable declaration.
     fn parse_local(&mut self, attrs: AttrVec) -> PResult<'a, P<Local>> {
-        let lo = self.prev_span;
+        let lo = self.prev_token.span;
         let pat = self.parse_top_pat(GateOr::Yes)?;
 
         let (err, ty) = if self.eat(&token::Colon) {
             // Save the state of the parser before parsing type normally, in case there is a `:`
             // instead of an `=` typo.
             let parser_snapshot_before_type = self.clone();
-            let colon_sp = self.prev_span;
+            let colon_sp = self.prev_token.span;
             match self.parse_ty() {
                 Ok(ty) => (None, Some(ty)),
                 Err(mut err) => {
@@ -284,7 +235,7 @@ impl<'a> Parser<'a> {
                 return Err(err);
             }
         };
-        let hi = if self.token == token::Semi { self.token.span } else { self.prev_span };
+        let hi = if self.token == token::Semi { self.token.span } else { self.prev_token.span };
         Ok(P(ast::Local { ty, pat, init, id: DUMMY_NODE_ID, span: lo.to(hi), attrs }))
     }
 
@@ -297,16 +248,6 @@ impl<'a> Parser<'a> {
         } else {
             Ok(None)
         }
-    }
-
-    fn is_auto_trait_item(&self) -> bool {
-        // auto trait
-        (self.token.is_keyword(kw::Auto) &&
-            self.is_keyword_ahead(1, &[kw::Trait]))
-        || // unsafe auto trait
-        (self.token.is_keyword(kw::Unsafe) &&
-         self.is_keyword_ahead(1, &[kw::Auto]) &&
-         self.is_keyword_ahead(2, &[kw::Trait]))
     }
 
     /// Parses a block. No inner attributes are allowed.
@@ -334,7 +275,7 @@ impl<'a> Parser<'a> {
         //      bar;
         //
         // which is valid in other languages, but not Rust.
-        match self.parse_stmt_without_recovery(false) {
+        match self.parse_stmt_without_recovery() {
             Ok(Some(stmt)) => {
                 if self.look_ahead(1, |t| t == &token::OpenDelim(token::Brace))
                     || do_not_suggest_help
@@ -346,7 +287,7 @@ impl<'a> Parser<'a> {
                 }
                 let stmt_span = if self.eat(&token::Semi) {
                     // Expand the span to include the semicolon.
-                    stmt.span.with_hi(self.prev_span.hi())
+                    stmt.span.with_hi(self.prev_token.span.hi())
                 } else {
                     stmt.span
                 };
@@ -393,7 +334,7 @@ impl<'a> Parser<'a> {
             if self.token == token::Eof {
                 break;
             }
-            let stmt = match self.parse_full_stmt(false) {
+            let stmt = match self.parse_full_stmt() {
                 Err(mut err) => {
                     self.maybe_annotate_with_ascription(&mut err, false);
                     err.emit();
@@ -409,61 +350,56 @@ impl<'a> Parser<'a> {
                 continue;
             };
         }
-        Ok(self.mk_block(stmts, s, lo.to(self.prev_span)))
+        Ok(self.mk_block(stmts, s, lo.to(self.prev_token.span)))
     }
 
     /// Parses a statement, including the trailing semicolon.
-    pub fn parse_full_stmt(&mut self, macro_legacy_warnings: bool) -> PResult<'a, Option<Stmt>> {
+    pub fn parse_full_stmt(&mut self) -> PResult<'a, Option<Stmt>> {
         // Skip looking for a trailing semicolon when we have an interpolated statement.
         maybe_whole!(self, NtStmt, |x| Some(x));
 
-        let mut stmt = match self.parse_stmt_without_recovery(macro_legacy_warnings)? {
+        let mut stmt = match self.parse_stmt_without_recovery()? {
             Some(stmt) => stmt,
             None => return Ok(None),
         };
 
         let mut eat_semi = true;
         match stmt.kind {
-            StmtKind::Expr(ref expr) if self.token != token::Eof => {
-                // expression without semicolon
-                if classify::expr_requires_semi_to_be_stmt(expr) {
-                    // Just check for errors and recover; do not eat semicolon yet.
-                    if let Err(mut e) =
-                        self.expect_one_of(&[], &[token::Semi, token::CloseDelim(token::Brace)])
-                    {
-                        if let TokenKind::DocComment(..) = self.token.kind {
-                            if let Ok(snippet) = self.span_to_snippet(self.token.span) {
-                                let sp = self.token.span;
-                                let marker = &snippet[..3];
-                                let (comment_marker, doc_comment_marker) = marker.split_at(2);
+            // Expression without semicolon.
+            StmtKind::Expr(ref expr)
+                if self.token != token::Eof && classify::expr_requires_semi_to_be_stmt(expr) =>
+            {
+                // Just check for errors and recover; do not eat semicolon yet.
+                if let Err(mut e) =
+                    self.expect_one_of(&[], &[token::Semi, token::CloseDelim(token::Brace)])
+                {
+                    if let TokenKind::DocComment(..) = self.token.kind {
+                        if let Ok(snippet) = self.span_to_snippet(self.token.span) {
+                            let sp = self.token.span;
+                            let marker = &snippet[..3];
+                            let (comment_marker, doc_comment_marker) = marker.split_at(2);
 
-                                e.span_suggestion(
-                                    sp.with_hi(sp.lo() + BytePos(marker.len() as u32)),
-                                    &format!(
-                                        "add a space before `{}` to use a regular comment",
-                                        doc_comment_marker,
-                                    ),
-                                    format!("{} {}", comment_marker, doc_comment_marker),
-                                    Applicability::MaybeIncorrect,
-                                );
-                            }
+                            e.span_suggestion(
+                                sp.with_hi(sp.lo() + BytePos(marker.len() as u32)),
+                                &format!(
+                                    "add a space before `{}` to use a regular comment",
+                                    doc_comment_marker,
+                                ),
+                                format!("{} {}", comment_marker, doc_comment_marker),
+                                Applicability::MaybeIncorrect,
+                            );
                         }
-                        e.emit();
-                        self.recover_stmt();
-                        // Don't complain about type errors in body tail after parse error (#57383).
-                        let sp = expr.span.to(self.prev_span);
-                        stmt.kind = StmtKind::Expr(self.mk_expr_err(sp));
                     }
+                    e.emit();
+                    self.recover_stmt();
+                    // Don't complain about type errors in body tail after parse error (#57383).
+                    let sp = expr.span.to(self.prev_token.span);
+                    stmt.kind = StmtKind::Expr(self.mk_expr_err(sp));
                 }
             }
             StmtKind::Local(..) => {
-                // We used to incorrectly allow a macro-expanded let statement to lack a semicolon.
-                if macro_legacy_warnings && self.token != token::Semi {
-                    self.warn_missing_semicolon();
-                } else {
-                    self.expect_semi()?;
-                    eat_semi = false;
-                }
+                self.expect_semi()?;
+                eat_semi = false;
             }
             _ => {}
         }
@@ -471,19 +407,8 @@ impl<'a> Parser<'a> {
         if eat_semi && self.eat(&token::Semi) {
             stmt = stmt.add_trailing_semicolon();
         }
-        stmt.span = stmt.span.to(self.prev_span);
+        stmt.span = stmt.span.to(self.prev_token.span);
         Ok(Some(stmt))
-    }
-
-    fn warn_missing_semicolon(&self) {
-        self.diagnostic()
-            .struct_span_warn(self.token.span, {
-                &format!("expected `;`, found {}", super::token_descr(&self.token))
-            })
-            .note({
-                "this was erroneously allowed and will become a hard error in a future release"
-            })
-            .emit();
     }
 
     pub(super) fn mk_block(&self, stmts: Vec<Stmt>, rules: BlockCheckMode, span: Span) -> P<Block> {

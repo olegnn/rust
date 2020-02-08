@@ -353,6 +353,7 @@ E0631: include_str!("./error_codes/E0631.md"),
 E0633: include_str!("./error_codes/E0633.md"),
 E0635: include_str!("./error_codes/E0635.md"),
 E0636: include_str!("./error_codes/E0636.md"),
+E0637: include_str!("./error_codes/E0637.md"),
 E0638: include_str!("./error_codes/E0638.md"),
 E0639: include_str!("./error_codes/E0639.md"),
 E0641: include_str!("./error_codes/E0641.md"),
@@ -416,6 +417,8 @@ E0743: include_str!("./error_codes/E0743.md"),
 E0744: include_str!("./error_codes/E0744.md"),
 E0745: include_str!("./error_codes/E0745.md"),
 E0746: include_str!("./error_codes/E0746.md"),
+E0747: include_str!("./error_codes/E0747.md"),
+E0748: include_str!("./error_codes/E0748.md"),
 ;
 //  E0006, // merged with E0005
 //  E0008, // cannot bind by-move into a pattern guard
@@ -584,7 +587,6 @@ E0746: include_str!("./error_codes/E0746.md"),
     E0632, // cannot provide explicit generic arguments when `impl Trait` is
            // used in argument position
     E0634, // type has conflicting packed representaton hints
-    E0637, // "'_" is not a valid lifetime bound
     E0640, // infer outlives requirements
 //  E0645, // trait aliases not finished
     E0657, // `impl Trait` can only capture lifetimes bound at the fn level

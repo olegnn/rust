@@ -28,8 +28,8 @@ use crate::{CachedModuleCodegen, CrateInfo, MemFlags, ModuleCodegen, ModuleKind}
 use rustc::middle::codegen_fn_attrs::CodegenFnAttrs;
 use rustc::middle::cstore::EncodedMetadata;
 use rustc::middle::cstore::{self, LinkagePreference};
+use rustc::middle::lang_items;
 use rustc::middle::lang_items::StartFnLangItem;
-use rustc::middle::weak_lang_items;
 use rustc::mir::mono::{CodegenUnit, CodegenUnitNameBuilder, MonoItem};
 use rustc::session::config::{self, EntryFnType, Lto};
 use rustc::session::Session;
@@ -437,10 +437,10 @@ pub fn maybe_create_entry_wrapper<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
         // listing.
         let main_ret_ty = cx.tcx().erase_regions(&main_ret_ty.no_bound_vars().unwrap());
 
-        if cx.get_defined_value("main").is_some() {
+        if cx.get_declared_value("main").is_some() {
             // FIXME: We should be smart and show a better diagnostic here.
             cx.sess()
-                .struct_span_err(sp, "entry symbol `main` defined multiple times")
+                .struct_span_err(sp, "entry symbol `main` declared multiple times")
                 .help("did you use `#[no_mangle]` on `fn main`? Use `#[start]` instead")
                 .emit();
             cx.sess().abort_if_errors();
@@ -847,11 +847,8 @@ impl CrateInfo {
 
             // No need to look for lang items that are whitelisted and don't
             // actually need to exist.
-            let missing = missing
-                .iter()
-                .cloned()
-                .filter(|&l| !weak_lang_items::whitelisted(tcx, l))
-                .collect();
+            let missing =
+                missing.iter().cloned().filter(|&l| !lang_items::whitelisted(tcx, l)).collect();
             info.missing_lang_items.insert(cnum, missing);
         }
 

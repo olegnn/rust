@@ -809,7 +809,7 @@ impl DepGraph {
             dep_node
         );
 
-        if unlikely!(diagnostics.len() > 0) {
+        if unlikely!(!diagnostics.is_empty()) {
             self.emit_diagnostics(tcx, data, dep_node_index, prev_dep_node_index, diagnostics);
         }
 
@@ -1122,6 +1122,7 @@ impl CurrentDepGraph {
 }
 
 impl DepGraphData {
+    #[inline(never)]
     fn read_index(&self, source: DepNodeIndex) {
         ty::tls::with_context_opt(|icx| {
             let icx = if let Some(icx) = icx { icx } else { return };

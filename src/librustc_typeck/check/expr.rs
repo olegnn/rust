@@ -17,26 +17,26 @@ use crate::check::TupleArgumentsFlag::DontTupleArguments;
 use crate::type_error_struct;
 use crate::util::common::ErrorReported;
 
-use rustc::infer;
-use rustc::infer::type_variable::{TypeVariableOrigin, TypeVariableOriginKind};
 use rustc::middle::lang_items;
-use rustc::traits::{self, ObligationCauseCode};
 use rustc::ty;
 use rustc::ty::adjustment::{Adjust, Adjustment, AllowTwoPhase, AutoBorrow, AutoBorrowMutability};
 use rustc::ty::Ty;
 use rustc::ty::TypeFoldable;
 use rustc::ty::{AdtKind, Visibility};
+use rustc_ast::ast;
+use rustc_ast::util::lev_distance::find_best_match_for_name;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_errors::{pluralize, struct_span_err, Applicability, DiagnosticBuilder, DiagnosticId};
 use rustc_hir as hir;
 use rustc_hir::def::{CtorKind, DefKind, Res};
 use rustc_hir::def_id::DefId;
 use rustc_hir::{ExprKind, QPath};
+use rustc_infer::infer;
+use rustc_infer::infer::type_variable::{TypeVariableOrigin, TypeVariableOriginKind};
+use rustc_infer::traits::{self, ObligationCauseCode};
 use rustc_span::hygiene::DesugaringKind;
 use rustc_span::source_map::Span;
 use rustc_span::symbol::{kw, sym, Symbol};
-use syntax::ast;
-use syntax::util::lev_distance::find_best_match_for_name;
 
 use std::fmt::Display;
 
@@ -1012,6 +1012,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             Ok(self.to_const(count, tcx.type_of(count_def_id)))
         } else {
             tcx.const_eval_poly(count_def_id)
+                .map(|val| ty::Const::from_value(tcx, val, tcx.type_of(count_def_id)))
         };
 
         let uty = match expected {
@@ -1311,6 +1312,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         ty_span: Span,
     ) {
         if variant.recovered {
+            self.set_tainted_by_errors();
             return;
         }
         let mut err = self.type_error_struct_with_diag(
@@ -1586,7 +1588,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 &format!("a method `{}` also exists, call it with parentheses", field),
                 field,
                 expr_t,
-                expr.hir_id,
+                expr,
             );
         }
         err.emit();
@@ -1609,7 +1611,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 "use parentheses to call the method",
                 field,
                 expr_t,
-                expr.hir_id,
+                expr,
             );
         } else {
             err.help("methods are immutable and cannot be assigned to");

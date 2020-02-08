@@ -11,6 +11,7 @@ use rustc::ty::fold::TypeVisitor;
 use rustc::ty::query::Providers;
 use rustc::ty::subst::InternalSubsts;
 use rustc::ty::{self, GenericParamDefKind, TraitRef, Ty, TyCtxt, TypeFoldable};
+use rustc_ast::ast::Ident;
 use rustc_attr as attr;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::struct_span_err;
@@ -22,7 +23,6 @@ use rustc_hir::{AssocItemKind, HirIdSet, Node, PatKind};
 use rustc_span::hygiene::Transparency;
 use rustc_span::symbol::{kw, sym};
 use rustc_span::Span;
-use syntax::ast::Ident;
 
 use std::marker::PhantomData;
 use std::{cmp, fmt, mem};
@@ -327,7 +327,7 @@ fn def_id_visibility<'tcx>(
                 }
                 Node::Expr(expr) => {
                     return (
-                        ty::Visibility::Restricted(tcx.hir().get_module_parent(expr.hir_id)),
+                        ty::Visibility::Restricted(tcx.parent_module(expr.hir_id)),
                         expr.span,
                         "private",
                     );
@@ -657,7 +657,7 @@ impl EmbargoVisitor<'tcx> {
                 .map(|module_hir_id| self.tcx.hir().expect_item(module_hir_id))
             {
                 if let hir::ItemKind::Mod(m) = &item.kind {
-                    for item_id in m.item_ids.as_ref() {
+                    for item_id in m.item_ids {
                         let item = self.tcx.hir().expect_item(item_id.id);
                         let def_id = self.tcx.hir().local_def_id(item_id.id);
                         if !self.tcx.hygienic_eq(segment.ident, item.ident, def_id) {
@@ -1781,17 +1781,20 @@ impl SearchInterfaceForPrivateItemsVisitor<'tcx> {
 
     fn check_def_id(&mut self, def_id: DefId, kind: &str, descr: &dyn fmt::Display) -> bool {
         if self.leaks_private_dep(def_id) {
-            self.tcx.lint_hir(
+            self.tcx.struct_span_lint_hir(
                 lint::builtin::EXPORTED_PRIVATE_DEPENDENCIES,
                 self.item_id,
                 self.span,
-                &format!(
-                    "{} `{}` from private dependency '{}' in public \
-                                        interface",
-                    kind,
-                    descr,
-                    self.tcx.crate_name(def_id.krate)
-                ),
+                |lint| {
+                    lint.build(&format!(
+                        "{} `{}` from private dependency '{}' in public \
+                                                interface",
+                        kind,
+                        descr,
+                        self.tcx.crate_name(def_id.krate)
+                    ))
+                    .emit()
+                },
             );
         }
 
@@ -1802,23 +1805,23 @@ impl SearchInterfaceForPrivateItemsVisitor<'tcx> {
 
         let (vis, vis_span, vis_descr) = def_id_visibility(self.tcx, def_id);
         if !vis.is_at_least(self.required_visibility, self.tcx) {
-            let msg = format!("{} {} `{}` in public interface", vis_descr, kind, descr);
+            let make_msg = || format!("{} {} `{}` in public interface", vis_descr, kind, descr);
             if self.has_pub_restricted || self.has_old_errors || self.in_assoc_ty {
                 let mut err = if kind == "trait" {
-                    struct_span_err!(self.tcx.sess, self.span, E0445, "{}", msg)
+                    struct_span_err!(self.tcx.sess, self.span, E0445, "{}", make_msg())
                 } else {
-                    struct_span_err!(self.tcx.sess, self.span, E0446, "{}", msg)
+                    struct_span_err!(self.tcx.sess, self.span, E0446, "{}", make_msg())
                 };
                 err.span_label(self.span, format!("can't leak {} {}", vis_descr, kind));
                 err.span_label(vis_span, format!("`{}` declared as {}", descr, vis_descr));
                 err.emit();
             } else {
                 let err_code = if kind == "trait" { "E0445" } else { "E0446" };
-                self.tcx.lint_hir(
+                self.tcx.struct_span_lint_hir(
                     lint::builtin::PRIVATE_IN_PUBLIC,
                     hir_id,
                     self.span,
-                    &format!("{} (error {})", msg, err_code),
+                    |lint| lint.build(&format!("{} (error {})", make_msg(), err_code)).emit(),
                 );
             }
         }

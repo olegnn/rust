@@ -1,5 +1,11 @@
 use crate::expand::{self, AstFragment, Invocation};
 
+use rustc_ast::ast::{self, Attribute, Name, NodeId, PatKind};
+use rustc_ast::mut_visit::{self, MutVisitor};
+use rustc_ast::ptr::P;
+use rustc_ast::token;
+use rustc_ast::tokenstream::{self, TokenStream};
+use rustc_ast::visit::{AssocCtxt, Visitor};
 use rustc_attr::{self as attr, Deprecation, HasAttrs, Stability};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::sync::{self, Lrc};
@@ -12,12 +18,6 @@ use rustc_span::source_map::SourceMap;
 use rustc_span::symbol::{kw, sym, Ident, Symbol};
 use rustc_span::{FileName, MultiSpan, Span, DUMMY_SP};
 use smallvec::{smallvec, SmallVec};
-use syntax::ast::{self, Attribute, Name, NodeId, PatKind};
-use syntax::mut_visit::{self, MutVisitor};
-use syntax::ptr::P;
-use syntax::token;
-use syntax::tokenstream::{self, TokenStream};
-use syntax::visit::{AssocCtxt, Visitor};
 
 use std::default::Default;
 use std::iter;
@@ -1113,7 +1113,11 @@ pub fn expr_to_string(
     err_msg: &str,
 ) -> Option<(Symbol, ast::StrStyle)> {
     expr_to_spanned_string(cx, expr, err_msg)
-        .map_err(|err| err.map(|mut err| err.emit()))
+        .map_err(|err| {
+            err.map(|mut err| {
+                err.emit();
+            })
+        })
         .ok()
         .map(|(symbol, style, _)| (symbol, style))
 }

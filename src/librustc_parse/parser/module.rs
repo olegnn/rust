@@ -4,19 +4,19 @@ use super::Parser;
 
 use crate::{new_sub_parser_from_file, DirectoryOwnership};
 
+use rustc_ast::ast::{self, Attribute, Crate, Ident, ItemKind, Mod};
+use rustc_ast::attr;
+use rustc_ast::token::{self, TokenKind};
 use rustc_errors::PResult;
 use rustc_span::source_map::{FileName, SourceMap, Span, DUMMY_SP};
-use rustc_span::symbol::sym;
-use syntax::ast::{self, Attribute, Crate, Ident, ItemKind, Mod};
-use syntax::attr;
-use syntax::token::{self, TokenKind};
+use rustc_span::symbol::{sym, Symbol};
 
 use std::path::{self, Path, PathBuf};
 
 /// Information about the path to a module.
 // Public for rustfmt usage.
 pub struct ModulePath {
-    name: String,
+    name: Symbol,
     path_exists: bool,
     pub result: Result<ModulePathSuccess, Error>,
 }
@@ -35,41 +35,41 @@ impl<'a> Parser<'a> {
             attrs: self.parse_inner_attributes()?,
             module: self.parse_mod_items(&token::Eof, lo)?,
             span: lo.to(self.token.span),
+            // Filled in by proc_macro_harness::inject()
+            proc_macros: Vec::new(),
         });
         krate
     }
 
     /// Parses a `mod <foo> { ... }` or `mod <foo>;` item.
-    pub(super) fn parse_item_mod(&mut self, outer_attrs: &[Attribute]) -> PResult<'a, ItemInfo> {
-        let (in_cfg, outer_attrs) =
-            crate::config::process_configure_mod(self.sess, self.cfg_mods, outer_attrs);
+    pub(super) fn parse_item_mod(&mut self, attrs: &mut Vec<Attribute>) -> PResult<'a, ItemInfo> {
+        let in_cfg = crate::config::process_configure_mod(self.sess, self.cfg_mods, attrs);
 
         let id_span = self.token.span;
         let id = self.parse_ident()?;
-        if self.eat(&token::Semi) {
+        let (module, mut inner_attrs) = if self.eat(&token::Semi) {
             if in_cfg && self.recurse_into_file_modules {
                 // This mod is in an external file. Let's go get it!
                 let ModulePathSuccess { path, directory_ownership } =
-                    self.submod_path(id, &outer_attrs, id_span)?;
-                let (module, attrs) =
-                    self.eval_src_mod(path, directory_ownership, id.to_string(), id_span)?;
-                Ok((id, ItemKind::Mod(module), Some(attrs)))
+                    self.submod_path(id, &attrs, id_span)?;
+                self.eval_src_mod(path, directory_ownership, id.to_string(), id_span)?
             } else {
-                let placeholder = ast::Mod { inner: DUMMY_SP, items: Vec::new(), inline: false };
-                Ok((id, ItemKind::Mod(placeholder), None))
+                (ast::Mod { inner: DUMMY_SP, items: Vec::new(), inline: false }, Vec::new())
             }
         } else {
             let old_directory = self.directory.clone();
-            self.push_directory(id, &outer_attrs);
+            self.push_directory(id, &attrs);
 
             self.expect(&token::OpenDelim(token::Brace))?;
             let mod_inner_lo = self.token.span;
-            let attrs = self.parse_inner_attributes()?;
+            let inner_attrs = self.parse_inner_attributes()?;
             let module = self.parse_mod_items(&token::CloseDelim(token::Brace), mod_inner_lo)?;
 
             self.directory = old_directory;
-            Ok((id, ItemKind::Mod(module), Some(attrs)))
-        }
+            (module, inner_attrs)
+        };
+        attrs.append(&mut inner_attrs);
+        Ok((id, ItemKind::Mod(module)))
     }
 
     /// Given a termination token, parses all of the items in a module.
@@ -90,7 +90,7 @@ impl<'a> Parser<'a> {
             }
         }
 
-        let hi = if self.token.span.is_dummy() { inner_lo } else { self.prev_span };
+        let hi = if self.token.span.is_dummy() { inner_lo } else { self.prev_token.span };
 
         Ok(Mod { inner: inner_lo.to(hi), items, inline: true })
     }
@@ -170,7 +170,7 @@ impl<'a> Parser<'a> {
                         &format!(
                             "... or maybe `use` the module `{}` instead \
                                             of possibly redeclaring it",
-                            paths.name
+                            paths.name.to_ident_string()
                         ),
                     );
                 }
@@ -216,10 +216,11 @@ impl<'a> Parser<'a> {
             ""
         };
 
-        let mod_name = id.name.to_string();
-        let default_path_str = format!("{}{}.rs", relative_prefix, mod_name);
+        let mod_name = id.name;
+        let mod_name_str = mod_name.to_string();
+        let default_path_str = format!("{}{}.rs", relative_prefix, mod_name_str);
         let secondary_path_str =
-            format!("{}{}{}mod.rs", relative_prefix, mod_name, path::MAIN_SEPARATOR);
+            format!("{}{}{}mod.rs", relative_prefix, mod_name_str, path::MAIN_SEPARATOR);
         let default_path = dir_path.join(&default_path_str);
         let secondary_path = dir_path.join(&secondary_path_str);
         let default_exists = source_map.file_exists(&default_path);
@@ -235,13 +236,13 @@ impl<'a> Parser<'a> {
                 directory_ownership: DirectoryOwnership::Owned { relative: None },
             }),
             (false, false) => Err(Error::FileNotFoundForModule {
-                mod_name: mod_name.clone(),
+                mod_name: mod_name_str.clone(),
                 default_path: default_path_str,
                 secondary_path: secondary_path_str,
                 dir_path: dir_path.display().to_string(),
             }),
             (true, true) => Err(Error::DuplicatePaths {
-                mod_name: mod_name.clone(),
+                mod_name: mod_name_str.clone(),
                 default_path: default_path_str,
                 secondary_path: secondary_path_str,
             }),
@@ -285,7 +286,7 @@ impl<'a> Parser<'a> {
 
     fn push_directory(&mut self, id: Ident, attrs: &[Attribute]) {
         if let Some(path) = attr::first_attr_value_str_by_name(attrs, sym::path) {
-            self.directory.path.to_mut().push(&*path.as_str());
+            self.directory.path.push(&*path.as_str());
             self.directory.ownership = DirectoryOwnership::Owned { relative: None };
         } else {
             // We have to push on the current module name in the case of relative
@@ -297,10 +298,10 @@ impl<'a> Parser<'a> {
             if let DirectoryOwnership::Owned { relative } = &mut self.directory.ownership {
                 if let Some(ident) = relative.take() {
                     // remove the relative offset
-                    self.directory.path.to_mut().push(&*ident.as_str());
+                    self.directory.path.push(&*ident.as_str());
                 }
             }
-            self.directory.path.to_mut().push(&*id.as_str());
+            self.directory.path.push(&*id.as_str());
         }
     }
 }
